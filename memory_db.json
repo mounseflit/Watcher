@@ -1,5 +1,5 @@
-{
-  "seen_urls": [
-    "https://www.um6p.ma/fr/actualites",
-  ]
+ {
+    "seen_urls": [],       # List of all URLs that have been processed
+    "details": {},         # Mapping from URL to its detailed description
+    "reports": []          # History of generated reports with timestamps
 }
