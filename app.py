@@ -49,10 +49,10 @@ import os
 import re
 import tempfile
 import time
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Optional
 
 import google.generativeai as genai
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, ValidationError
 
 
@@ -99,8 +99,13 @@ SOURCES_FILE: str = os.getenv("SOURCES_FILE", "sources.json")
 MEMORY_FILE: str = os.getenv("MEMORY_FILE", "memory_db.json")
 
 # Default structure for an empty memory file.  Using a dict makes it trivial
-# to extend the schema later if needed.
-DEFAULT_MEMORY: Dict[str, Any] = {"seen_urls": []}
+# to extend the schema later if needed.  In addition to the list of seen URLs,
+# we now store a mapping of URL -> detailed description and a list of reports.
+DEFAULT_MEMORY: Dict[str, Any] = {
+    "seen_urls": [],       # List of all URLs that have been processed
+    "details": {},         # Mapping from URL to its detailed description
+    "reports": []          # History of generated reports with timestamps
+}
 
 
 # -----------------------------------------------------------------------------
@@ -114,21 +119,34 @@ class SourceConfig(BaseModel):
     veille_par_url: List[str] = []
 
 
+# Request model for updating the sources configuration.  Clients can either
+# specify a complete replacement via the `replace` field or indicate lists of
+# subjects/URLs to add or remove.  At least one of the fields must be
+# provided.
+class UpdateSourcesRequest(BaseModel):
+    add_subjects: Optional[List[str]] = None
+    add_urls: Optional[List[str]] = None
+    remove_subjects: Optional[List[str]] = None
+    remove_urls: Optional[List[str]] = None
+    replace: Optional[SourceConfig] = None
+
+
 # -----------------------------------------------------------------------------
 # Memory management helpers
 #
-def safe_load_memory(path: str = MEMORY_FILE) -> Set[str]:
-    """Load the set of previously seen URLs from the memory file.
+def safe_load_memory(path: str = MEMORY_FILE) -> Dict[str, Any]:
+    """Load the persisted memory from disk.
 
     If the file is missing, empty, corrupt, or does not match the expected
-    schema, an empty set is returned and a log message is emitted.  This
-    behaviour avoids raising exceptions from background tasks and allows the
-    watcher to recover gracefully from invalid state.
+    schema, a fresh copy of ``DEFAULT_MEMORY`` is returned and a log message
+    is emitted.  The returned value always contains the keys ``seen_urls``,
+    ``details``, and ``reports``.
 
     Args:
         path: The path to the memory JSON file.
     Returns:
-        A set of URLs previously stored.
+        A dictionary with keys ``seen_urls`` (list of str), ``details`` (dict
+        mapping str to str), and ``reports`` (list of dicts).
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -137,51 +155,67 @@ def safe_load_memory(path: str = MEMORY_FILE) -> Set[str]:
             logger.warning(
                 f"Format de fichier mémoire invalide pour '{path}'. Réinitialisation de la mémoire."
             )
-            return set()
-        urls = data.get("seen_urls", [])
-        if not isinstance(urls, list):
+            return DEFAULT_MEMORY.copy()
+        # Assemble a full memory dict, filling in missing keys with defaults.
+        memory: Dict[str, Any] = {
+            "seen_urls": data.get("seen_urls", []),
+            "details": data.get("details", {}),
+            "reports": data.get("reports", []),
+        }
+        # Validate types: seen_urls must be list, details must be dict, reports must be list
+        if not isinstance(memory["seen_urls"], list):
             logger.warning(
                 f"Le champ 'seen_urls' dans '{path}' n'est pas une liste. Réinitialisation de la mémoire."
             )
-            return set()
-        return set(urls)
+            return DEFAULT_MEMORY.copy()
+        if not isinstance(memory["details"], dict):
+            logger.warning(
+                f"Le champ 'details' dans '{path}' n'est pas un objet. Réinitialisation de la mémoire."
+            )
+            return DEFAULT_MEMORY.copy()
+        if not isinstance(memory["reports"], list):
+            logger.warning(
+                f"Le champ 'reports' dans '{path}' n'est pas une liste. Réinitialisation de la mémoire."
+            )
+            return DEFAULT_MEMORY.copy()
+        return memory
     except FileNotFoundError:
         logger.info(f"Fichier mémoire '{path}' non trouvé. Initialisation d'une nouvelle mémoire.")
-        return set()
+        return DEFAULT_MEMORY.copy()
     except (json.JSONDecodeError, OSError) as e:
         logger.error(f"Impossible de lire le fichier mémoire '{path}': {e}. Réinitialisation de la mémoire.")
-        return set()
+        return DEFAULT_MEMORY.copy()
 
 
-def atomic_save_memory(urls: Set[str], path: str = MEMORY_FILE) -> None:
-    """Atomically write the set of seen URLs to the memory file.
+def atomic_save_memory(memory: Dict[str, Any], path: str = MEMORY_FILE) -> None:
+    """Atomically write the full memory structure to disk.
 
-    Data is first written to a temporary file in the same directory and then
-    moved into place.  This pattern guards against partial writes if the
-    process crashes or is killed during the write.
+    The data is first written to a temporary file within the same directory
+    before being moved into place.  This prevents partial writes from
+    corrupting the memory file.  The ``seen_urls`` list will be sorted to
+    ensure deterministic ordering.
 
     Args:
-        urls: The set of URLs to persist.
+        memory: The memory dictionary to persist.  Must contain keys
+            ``seen_urls``, ``details``, and ``reports``.
         path: The target memory file path.
     """
-    # Prepare the directory for the temporary file.  If the directory is the
-    # current working directory (""), `os.makedirs` with empty string is a no-op.
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
-    # Sort the URLs to ensure deterministic output for diff‑based tools.
-    data_to_write = {"seen_urls": sorted(urls)}
-    # Create a temporary file in the target directory.  Using `text=True` makes
-    # the file handle operate in text mode.
+    # Ensure 'seen_urls' is sorted for consistency.
+    mem_copy = memory.copy()
+    mem_copy["seen_urls"] = sorted(set(mem_copy.get("seen_urls", [])))
     fd, temp_path = tempfile.mkstemp(prefix=".memory_tmp_", dir=directory, text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
-            json.dump(data_to_write, tmp_file, ensure_ascii=False, indent=2)
+            json.dump(mem_copy, tmp_file, ensure_ascii=False, indent=2)
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
         os.replace(temp_path, path)
-        logger.info(f"Sauvegarde de la mémoire terminée. Nombre total d'URLs: {len(urls)}.")
+        logger.info(
+            f"Sauvegarde de la mémoire terminée. Nombre total d'URLs: {len(mem_copy['seen_urls'])}."
+        )
     finally:
-        # In case of exceptions during write/replace, clean up the temp file.
         try:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -274,8 +308,12 @@ async def perform_watch_task() -> None:
 
     subjects_to_watch = config.veille_par_sujet
     urls_to_watch = config.veille_par_url
-    seen_urls = safe_load_memory()
-    newly_found_urls: Set[str] = set()
+    # Load the full memory structure.  This provides seen_urls, details and reports.
+    memory = safe_load_memory()
+    seen_urls_set: Set[str] = set(memory.get("seen_urls", []))
+    details: Dict[str, str] = memory.get("details", {})
+    new_urls: Set[str] = set()
+    new_details: Dict[str, str] = {}
 
     # Step 1: Monitor by subjects.  For each subject, ask Gemini to suggest a
     # handful of relevant URLs.  The prompt instructs the model to output only
@@ -284,7 +322,7 @@ async def perform_watch_task() -> None:
     for subject in subjects_to_watch:
         logger.info(f"Analyse du sujet: '{subject}'")
         prompt = (
-            f"Liste jusqu'à cinq URLs pertinentes qui traitent du sujet suivant: {subject}. "
+            f"Liste jusqu'à 10 URLs pertinentes qui traitent du sujet suivant: {subject}. "
             "Retourne uniquement les URLs (commençant par http ou https) séparées par des espaces ou des sauts de ligne. "
             "Ne fournis aucune explication ou autre texte."
         )
@@ -292,33 +330,76 @@ async def perform_watch_task() -> None:
         if not response_text:
             logger.info(f"Aucune réponse obtenue pour le sujet '{subject}'.")
             continue
-        # Extraire toutes les URLs HTTP/HTTPS à l'aide d'une regex simple.  On
-        # coupe les éventuelles ponctuations finales.
         urls = re.findall(r"https?://\S+", response_text)
         cleaned_urls = [u.rstrip('.,);') for u in urls]
-        new_urls = [url for url in cleaned_urls if url not in seen_urls]
-        if new_urls:
-            newly_found_urls.update(new_urls)
-            logger.info(
-                f"{len(new_urls)} nouvelles URL(s) trouvée(s) pour le sujet '{subject}'."
-            )
-        else:
-            logger.info(f"Aucune nouvelle URL pour le sujet '{subject}'.")
+        for url in cleaned_urls:
+            if url in seen_urls_set or url in new_urls:
+                continue
+            new_urls.add(url)
+            logger.info(f"Nouvelle URL détectée pour le sujet '{subject}': {url}")
 
     # Step 2: Monitor by explicit URLs.  Any URL not already in memory is
-    # considered new.  At this stage we do not fetch or summarise the content;
-    # only deduplicate and store.
+    # considered new.
     for url in urls_to_watch:
-        if url in seen_urls:
+        if url in seen_urls_set or url in new_urls:
             logger.info(f"URL déjà connue, ignorée: '{url}'")
             continue
-        newly_found_urls.add(url)
+        new_urls.add(url)
         logger.info(f"Nouvelle URL ajoutée depuis la configuration: '{url}'")
 
-    # Step 3: Persist the union of old and new URLs if any new ones were found.
-    if newly_found_urls:
-        updated_urls = seen_urls.union(newly_found_urls)
-        atomic_save_memory(updated_urls)
+    # Step 3: For each newly discovered URL, generate a detailed description.
+    for url in new_urls:
+        # Build a prompt asking the model to describe the content of the URL.
+        description_prompt = (
+            f"Rédige un résumé détaillé et précis en français du contenu trouvé sur cette page : {url}. "
+            "Mets l'accent sur les mises à jour, les nouvelles ou les détails importants que cette page apporte. "
+            "Si tu ne peux pas accéder directement à la page, base-toi sur tes connaissances générales pour deviner la nature du contenu."
+        )
+        description = call_gemini_with_retry(description_prompt)
+        if not description:
+            description = "Aucune description disponible pour cette URL."
+        new_details[url] = description
+        logger.info(f"Description générée pour '{url}'.")
+
+    # Step 4: Generate a synthetic report summarising all new details.
+    report_text = ""
+    if new_details:
+        # Compose a prompt summarising the new details.
+        summary_lines = [f"{url}: {desc}" for url, desc in new_details.items()]
+        report_prompt = (
+            "Rédige un rapport synthétique en français qui résume les nouvelles informations suivantes en mettant en avant les éléments clés et leur pertinence :\n"
+            + "\n".join(summary_lines)
+        )
+        report = call_gemini_with_retry(report_prompt)
+        if report:
+            report_text = report
+        else:
+            # Fallback to concatenating the descriptions if the model fails.
+            report_text = "\n".join(summary_lines)
+
+    # Step 5: Persist the updated memory if there are any new URLs or details.
+    if new_urls:
+        # Update seen_urls, details, and reports in memory.
+        memory_seen = set(memory.get("seen_urls", []))
+        memory_seen.update(new_urls)
+        memory["seen_urls"] = list(memory_seen)
+        # Merge existing details with new ones
+        merged_details = memory.get("details", {})
+        merged_details.update(new_details)
+        memory["details"] = merged_details
+        # Append report entry if we generated a report
+        if report_text:
+            import datetime
+            report_entry = {
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "new_urls": list(new_urls),
+                "report": report_text,
+            }
+            reports_list = memory.get("reports", [])
+            reports_list.append(report_entry)
+            memory["reports"] = reports_list
+        # Save memory to disk
+        atomic_save_memory(memory)
     else:
         logger.info("Aucune nouvelle URL à sauvegarder.")
 
@@ -356,14 +437,111 @@ async def trigger_watch_endpoint(background_tasks: BackgroundTasks) -> Dict[str,
     }
 
 
-@app.get("/memory", summary="Affiche le contenu actuel de la mémoire")
-async def get_memory_content() -> Dict[str, List[str]]:
-    """Return the list of all seen URLs for debugging purposes."""
-    seen = safe_load_memory()
-    return {"seen_urls": sorted(seen)}
+@app.get("/memory", summary="Affiche la mémoire complète")
+async def get_memory_content() -> Dict[str, Any]:
+    """Return the full memory structure.
+
+    This includes the list of seen URLs, the stored descriptions for each URL
+    and the history of generated reports.
+    """
+    memory = safe_load_memory()
+    return memory
 
 
 @app.get("/", summary="Endpoint de santé")
 async def root() -> Dict[str, str]:
     """Simple health‑check endpoint."""
     return {"status": "ok", "message": "Watcher API is operational."}
+
+
+# -----------------------------------------------------------------------------
+# Sources management endpoints
+#
+@app.get("/sources", summary="Lire la configuration des sources")
+async def read_sources() -> Dict[str, Any]:
+    """Return the current sources configuration.
+
+    Reads the contents of the sources file and returns it.  If the file is
+    missing or corrupt, an HTTP error is raised.
+    """
+    try:
+        with open(SOURCES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Validate using SourceConfig to ensure correct structure
+        config = SourceConfig(**data)
+        return config.dict()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Le fichier '{SOURCES_FILE}' est introuvable.")
+    except (json.JSONDecodeError, ValidationError) as e:
+        raise HTTPException(status_code=500, detail=f"Le fichier '{SOURCES_FILE}' est invalide: {e}")
+
+
+@app.post("/sources", summary="Modifier la configuration des sources")
+async def update_sources(update: UpdateSourcesRequest) -> Dict[str, Any]:
+    """Update the sources configuration.
+
+    Clients can specify lists of subjects and/or URLs to add or remove, or
+    provide a complete replacement configuration via the `replace` field.
+    Unknown keys in the payload will be ignored.
+    """
+    # Load existing configuration or initialize a fresh one if the file is missing.
+    try:
+        if os.path.exists(SOURCES_FILE):
+            with open(SOURCES_FILE, "r", encoding="utf-8") as f:
+                current_data = json.load(f)
+            current_config = SourceConfig(**current_data)
+        else:
+            current_config = SourceConfig()
+    except (json.JSONDecodeError, ValidationError) as e:
+        raise HTTPException(status_code=500, detail=f"Le fichier '{SOURCES_FILE}' est invalide: {e}")
+
+    # If replace is provided, overwrite entirely with the new configuration.
+    if update.replace is not None:
+        new_config = update.replace
+    else:
+        # Start from the current config and apply additions/removals.
+        new_config = SourceConfig(
+            veille_par_sujet=list(current_config.veille_par_sujet),
+            veille_par_url=list(current_config.veille_par_url),
+        )
+        # Add new subjects
+        if update.add_subjects:
+            for subj in update.add_subjects:
+                if subj not in new_config.veille_par_sujet:
+                    new_config.veille_par_sujet.append(subj)
+        # Add new URLs
+        if update.add_urls:
+            for url in update.add_urls:
+                if url not in new_config.veille_par_url:
+                    new_config.veille_par_url.append(url)
+        # Remove subjects
+        if update.remove_subjects:
+            new_config.veille_par_sujet = [s for s in new_config.veille_par_sujet if s not in update.remove_subjects]
+        # Remove URLs
+        if update.remove_urls:
+            new_config.veille_par_url = [u for u in new_config.veille_par_url if u not in update.remove_urls]
+
+    # Persist the updated configuration
+    try:
+        with open(SOURCES_FILE, "w", encoding="utf-8") as f:
+            json.dump(new_config.dict(), f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de l'écriture de '{SOURCES_FILE}': {e}")
+    return new_config.dict()
+
+
+# -----------------------------------------------------------------------------
+# Details and reports endpoints
+#
+@app.get("/details", summary="Consulter les descriptions enregistrées")
+async def get_details() -> Dict[str, str]:
+    """Return the mapping of URLs to their detailed descriptions."""
+    memory = safe_load_memory()
+    return memory.get("details", {})
+
+
+@app.get("/reports", summary="Consulter l'historique des rapports générés")
+async def get_reports() -> List[Dict[str, Any]]:
+    """Return the list of generated reports."""
+    memory = safe_load_memory()
+    return memory.get("reports", [])
