@@ -558,3 +558,4 @@ async def get_reports() -> List[Dict[str, Any]]:
     memory = safe_load_memory()
     return memory.get("reports", [])
 
+
