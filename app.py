@@ -55,6 +55,9 @@ import google.generativeai as genai
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, ValidationError
 
+# fix cors problems
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # -----------------------------------------------------------------------------
 # Logging configuration
@@ -416,6 +419,15 @@ app = FastAPI(
     ),
 )
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
 
 @app.post("/watch", summary="Déclenche la veille en tâche de fond")
 async def trigger_watch_endpoint(background_tasks: BackgroundTasks) -> Dict[str, str]:
@@ -545,3 +557,4 @@ async def get_reports() -> List[Dict[str, Any]]:
     """Return the list of generated reports."""
     memory = safe_load_memory()
     return memory.get("reports", [])
+
