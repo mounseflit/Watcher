@@ -3,7 +3,7 @@ import requests
 import datetime
 
 def ping_backend():
-    url = "https://rag-api-807h.onrender.com/file_summary" #replace this url with your backend url & endpoint
+    url = "https://watcher-fn3v.onrender.com/" #api
     
     try:
         print(f"{datetime.datetime.now()}: Pinging {url}")
@@ -11,7 +11,7 @@ def ping_backend():
         print(f"Response: {response.status_code}")
         
         if response.status_code == 200:
-            print("Backend is alive")
+            print("Job launched")
         else:
             print(f"⚠️ Unexpected status code: {response.status_code}")
             
