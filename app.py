@@ -397,8 +397,8 @@ async def perform_watch_task() -> None:
 # -----------------------------------------------------------------------------
 # FastAPI app
 app = FastAPI(
-    title="Watcher API v2 (with Scraping & URL Context)",
-    description="API de veille stratégique avec scraping basique et contexte URL pour Gemini.",
+    title="Watcher API ",
+    description="API de veille stratégique",
 )
 
 app.add_middleware(
@@ -487,3 +487,4 @@ async def get_details() -> Dict[str, Any]:
 async def get_reports() -> List[Dict[str, Any]]:
     memory = safe_load_memory()
     return memory.get("reports", [])
+
