@@ -37,7 +37,6 @@ logger = logging.getLogger(__name__)
 # Gemini API configuration
 try:
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    
 except KeyError:
     logger.critical(
         "Erreur critique: la variable d'environnement GEMINI_API_KEY n'est pas définie."
@@ -56,7 +55,7 @@ MEMORY_FILE: str = os.getenv("MEMORY_FILE", "memory_db.json")
 
 DEFAULT_MEMORY: Dict[str, Any] = {
     "seen_urls": [],
-    "details": {},     # url -> {"title": str, "summary": str, "text": str}
+    "details": {},  # url -> {"title": str, "summary": str, "text": str}
     "reports": [],
 }
 
@@ -66,6 +65,7 @@ class SourceConfig(BaseModel):
     veille_par_sujet: List[str] = []
     veille_par_url: List[str] = []
 
+
 class UpdateSourcesRequest(BaseModel):
     add_subjects: Optional[List[str]] = None
     add_urls: Optional[List[str]] = None
@@ -73,9 +73,14 @@ class UpdateSourcesRequest(BaseModel):
     remove_urls: Optional[List[str]] = None
     replace: Optional[SourceConfig] = None
 
+
 # -----------------------------------------------------------------------------
 # Memory helpers
 def safe_load_memory(path: str = MEMORY_FILE) -> Dict[str, Any]:
+    """
+    Charge le contenu du fichier mémoire en toute sécurité. Si le fichier est
+    inexistant ou mal formé, retourne une mémoire vierge.
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -89,6 +94,7 @@ def safe_load_memory(path: str = MEMORY_FILE) -> Dict[str, Any]:
             "details": data.get("details", {}),
             "reports": data.get("reports", []),
         }
+        # Validate types
         if not isinstance(memory["seen_urls"], list):
             logger.warning(f"'seen_urls' n'est pas une liste. Reset.")
             return DEFAULT_MEMORY.copy()
@@ -106,7 +112,11 @@ def safe_load_memory(path: str = MEMORY_FILE) -> Dict[str, Any]:
         logger.error(f"Lecture mémoire '{path}' impossible: {e}. Reset.")
         return DEFAULT_MEMORY.copy()
 
+
 def atomic_save_memory(memory: Dict[str, Any], path: str = MEMORY_FILE) -> None:
+    """
+    Enregistre la mémoire de manière atomique pour éviter la corruption de fichier.
+    """
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
     mem_copy = memory.copy()
@@ -128,6 +138,7 @@ def atomic_save_memory(memory: Dict[str, Any], path: str = MEMORY_FILE) -> None:
         except OSError:
             pass
 
+
 # -----------------------------------------------------------------------------
 # Scraping helpers (NEW)
 USER_AGENT = (
@@ -135,22 +146,26 @@ USER_AGENT = (
     "PythonRequests"
 )
 
+
 def _clean_text(text: str) -> str:
-    # Normalize whitespace, remove extra blank lines
+    """
+    Normalise les espaces et supprime les lignes vides en excès.
+    """
     text = re.sub(r"\r", "\n", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
     return text.strip()
 
+
 def extract_main_text(html: str) -> Tuple[str, str]:
     """
-    Extract (title, visible_text) from HTML using BeautifulSoup if available.
-    If BeautifulSoup is missing, return a rough fallback.
+    Extrait le titre et le texte principal d'un document HTML. Utilise BeautifulSoup
+    si disponible, sinon effectue un décapage basique des balises.
     """
     if not html:
         return ("", "")
     if BeautifulSoup is None:
-        # crude fallback: strip tags
+        # fallback: strip tags crudely
         title_match = re.search(r"<title>(.*?)</title>", html, re.I | re.S)
         title = title_match.group(1).strip() if title_match else ""
         # remove tags
@@ -161,7 +176,7 @@ def extract_main_text(html: str) -> Tuple[str, str]:
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # remove scripts/styles/nav/footer
+    # remove scripts/styles and common non-content containers
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     for sel in ["nav", "footer", "header", "form", "aside"]:
@@ -172,14 +187,11 @@ def extract_main_text(html: str) -> Tuple[str, str]:
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
     else:
-        # try meta og:title
         og = soup.find("meta", attrs={"property": "og:title"})
         if og and og.get("content"):
             title = og["content"].strip()
 
-    # prefer common article containers if present
     candidates = soup.select("article") or soup.select("main") or [soup.body or soup]
-    # join text from candidates
     chunks: List[str] = []
     for node in candidates:
         text = node.get_text(separator="\n", strip=True)
@@ -188,9 +200,11 @@ def extract_main_text(html: str) -> Tuple[str, str]:
     text = "\n\n".join(chunks) if chunks else soup.get_text(separator="\n", strip=True)
     return (title, _clean_text(text))
 
+
 def fetch_url_text(url: str, timeout: int = 12) -> Tuple[str, str]:
     """
-    Returns (title, main_text). Empty strings if requests isn't available or fetch failed.
+    Tente de récupérer le contenu HTML d'une URL et d'en extraire le titre et le
+    texte principal. En cas d'échec, retourne des chaînes vides.
     """
     if requests is None:
         logger.warning("Le module 'requests' n'est pas installé. Impossible de scraper.")
@@ -210,6 +224,7 @@ def fetch_url_text(url: str, timeout: int = 12) -> Tuple[str, str]:
         logger.warning(f"Erreur réseau pour {url}: {e}")
         return ("", "")
 
+
 # -----------------------------------------------------------------------------
 # Gemini helpers
 def call_gemini_with_retry(
@@ -221,20 +236,23 @@ def call_gemini_with_retry(
     model_name: str = DEFAULT_MODEL,
 ) -> str:
     """
-    Call Gemini with retry. Provide either `prompt` (string) OR `contents` (list of parts).
-    Returns plain text (str) or "" on failure.
+    Appelle le modèle Gemini avec gestion de la reconnexion. Accepte soit un
+    `prompt` (chaîne de caractères) soit `contents` (liste de messages structurés).
+    Retourne le texte de la réponse ou une chaîne vide en cas d'échec.
     """
     model = genai.GenerativeModel(model_name=model_name)
     for attempt in range(max_retries):
         try:
             if contents is not None:
-                response = model.generate_content(contents)
+                # Lorsque 'contents' est fourni, passe-le explicitement en tant que
+                # paramètre nommé pour éviter les confusions avec 'prompt'.
+                response = model.generate_content(contents=contents)
             elif prompt is not None:
                 response = model.generate_content(prompt)
             else:
                 raise ValueError("Either `prompt` or `contents` must be provided.")
 
-            # standardize text extraction
+            # extraction standardisée du texte de la réponse
             if getattr(response, "text", None):
                 return response.text.strip()
             if getattr(response, "candidates", None):
@@ -251,44 +269,46 @@ def call_gemini_with_retry(
             time.sleep(sleep_time)
     return ""
 
+
 def summarize_with_url_context(url: str, scraped_text: str) -> str:
     """
-    Try Gemini URL Context first. If not supported or fails, fall back to summarizing the scraped text.
+    Tente d'analyser et de résumer le contenu d'une URL. Si l'utilisation du
+    contexte URL n'est pas disponible, s'appuie sur le texte scrappé. Cette
+    fonction n'utilise pas de 'url' part direct, car le SDK ne reconnaît pas un
+    dictionnaire avec la clé 'url' seule【649065952783530†L207-L260】. À la place,
+    on fournit l'URL comme simple texte dans le prompt. En cas d'échec ou si
+    aucun texte n'est disponible, retourne un message par défaut.
     """
-    # 1) Try URL Context (per https://ai.google.dev/gemini-api/docs/url-context)
-    # Newer SDKs accept a "url" part inside a content list, like:
-    # contents = [{"role": "user", "parts": [{"text": "...prompt..."}, {"url": url}]}]
+    # 1) Prompt pour demander un résumé en mentionnant l'URL. On évite d'utiliser
+    # un 'url' part non pris en charge par le SDK.
     url_prompt = (
         "Analyse et résume précisément en français le contenu de cette URL. "
         "Mets en avant les mises à jour, nouvelles informations et points clés. "
         "Structure la réponse avec des puces claires et un court paragraphe de synthèse à la fin."
     )
+
+    # On construit un prompt textuel qui inclut explicitement l'URL. Le modèle
+    # pourra utiliser ses connaissances ou échouer silencieusement si la
+    # récupération n'est pas possible.
     try:
-        contents = [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": url_prompt},
-                    {"url": url},  # URL Context
-                ],
-            }
-        ]
-        text = call_gemini_with_retry(contents=contents)
+        combined_prompt = f"{url_prompt}\n\nURL: {url}"
+        text = call_gemini_with_retry(prompt=combined_prompt)
         if text:
             return text
     except Exception as e:
-        logger.info(f"URL Context non disponible ou a échoué pour {url}: {e}")
+        logger.info(f"Contexte URL non disponible ou a échoué pour {url}: {e}")
 
-    # 2) Fallback: summarize scraped text if available
+    # 2) Fallback: si nous disposons du texte scrappé, résume-le.
     if scraped_text:
         fallback_prompt = (
             "Voici le contenu d'une page web. Résume-le en français, en listant d'abord les points clés, "
             "puis une synthèse courte et actionnable.\n\n"
-            f"CONTENU:\n{scraped_text[:15000]}"  # keep a safe token budget
+            f"CONTENU:\n{scraped_text[:15000]}"
         )
         return call_gemini_with_retry(prompt=fallback_prompt) or "Aucune description disponible pour cette URL."
-    # 3) Last resort
+    # 3) Dernier recours
     return "Aucune description disponible pour cette URL."
+
 
 # -----------------------------------------------------------------------------
 # Veille logic
@@ -341,7 +361,7 @@ async def perform_watch_task() -> None:
         new_urls.add(url)
         logger.info(f"Nouvelle URL depuis la configuration: '{url}'")
 
-    # Step 3: For each newly discovered URL: SCRAPE + SUMMARIZE with URL Context
+    # Step 3: For each newly discovered URL: SCRAPE + SUMMARIZE
     for url in new_urls:
         title, text = fetch_url_text(url)
         summary = summarize_with_url_context(url, text)
@@ -395,6 +415,7 @@ async def perform_watch_task() -> None:
         logger.info("Aucune nouvelle URL à sauvegarder.")
     logger.info("Tâche de veille terminée.")
 
+
 # -----------------------------------------------------------------------------
 # FastAPI app
 app = FastAPI(
@@ -410,6 +431,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.post("/watch", summary="Déclenche la veille en tâche de fond")
 async def trigger_watch_endpoint(background_tasks: BackgroundTasks) -> Dict[str, str]:
     background_tasks.add_task(perform_watch_task)
@@ -418,13 +440,16 @@ async def trigger_watch_endpoint(background_tasks: BackgroundTasks) -> Dict[str,
         "message": "La veille a été lancée en arrière-plan. Consultez les logs pour les détails."
     }
 
+
 @app.get("/memory", summary="Affiche la mémoire complète")
 async def get_memory_content() -> Dict[str, Any]:
     return safe_load_memory()
 
+
 @app.get("/", summary="Endpoint de santé")
 async def root() -> Dict[str, str]:
     return {"status": "ok", "message": "Watcher API is operational."}
+
 
 # Sources management
 @app.get("/sources", summary="Lire la configuration des sources")
@@ -438,6 +463,7 @@ async def read_sources() -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Le fichier '{SOURCES_FILE}' est introuvable.")
     except (json.JSONDecodeError, ValidationError) as e:
         raise HTTPException(status_code=500, detail=f"Le fichier '{SOURCES_FILE}' est invalide: {e}")
+
 
 @app.post("/sources", summary="Modifier la configuration des sources")
 async def update_sources(update: UpdateSourcesRequest) -> Dict[str, Any]:
@@ -478,11 +504,13 @@ async def update_sources(update: UpdateSourcesRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Erreur lors de l'écriture de '{SOURCES_FILE}': {e}")
     return new_config.dict()
 
+
 # Details & reports
 @app.get("/details", summary="Consulter les descriptions enregistrées")
 async def get_details() -> Dict[str, Any]:
     memory = safe_load_memory()
     return memory.get("details", {})
+
 
 @app.get("/reports", summary="Consulter l'historique des rapports générés")
 async def get_reports() -> List[Dict[str, Any]]:
