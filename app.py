@@ -218,7 +218,9 @@ def call_gemini_with_retry(
     for attempt in range(max_retries):
         try:
             response = model.generate_content(
-                        contents="Give me three day events schedule based on YOUR_URL. Also let me know what needs to taken care of considering weather and commute.",
+                        contents=[
+                            {"role": "user", "content": prompt}
+                        ],
                         generation_config=GenerationConfig(
                             tools=tools,
                         )
@@ -529,6 +531,7 @@ async def get_reports() -> List[Dict[str, Any]]:
     """Return the list of generated reports."""
     memory = safe_load_memory()
     return memory.get("reports", [])
+
 
 
 
