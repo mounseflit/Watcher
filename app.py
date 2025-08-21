@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 # Gemini once at import time so that model initialisation in `call_gemini`
 # happens quickly.
 try:
-    # genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    genai.configure(api_key="AIzaSyBXhRRf9eMJE1T6p_UtzWLfpylD1FAIyEk")
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    
 except KeyError:
     logger.critical(
         "Erreur critique: la variable d'environnement GEMINI_API_KEY n'est pas définie."
@@ -529,6 +529,7 @@ async def get_reports() -> List[Dict[str, Any]]:
     """Return the list of generated reports."""
     memory = safe_load_memory()
     return memory.get("reports", [])
+
 
 
 
