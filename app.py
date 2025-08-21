@@ -5,67 +5,86 @@ import os
 import re
 import tempfile
 import time
-from typing import Any, Dict, List, Set, Optional, Tuple
+from typing import Any, Dict, List, Set, Optional
 
 import google.generativeai as genai
+from google.generativeai.types import Tool
+from google.generativeai.types.generation_types import GenerationConfig
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, ValidationError
 
 # fix cors problems
 from fastapi.middleware.cors import CORSMiddleware
 
-# NEW: lightweight scraping
-try:
-    import requests
-except Exception:
-    requests = None
-
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None
 
 # -----------------------------------------------------------------------------
 # Logging configuration
+#
+# Configure the root logger to emit timestamped messages.  This helps when
+# debugging asynchronous background tasks, as their logs may appear interleaved
+# with request logs.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+
 # -----------------------------------------------------------------------------
 # Gemini API configuration
+#
+# The Gemini client library reads the API key from an environment variable.  If
+# the variable is not set, we log a critical error and exit.  We configure
+# Gemini once at import time so that model initialisation in `call_gemini`
+# happens quickly.
 try:
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    # genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    genai.configure(api_key="AIzaSyBXhRRf9eMJE1T6p_UtzWLfpylD1FAIyEk")
 except KeyError:
     logger.critical(
         "Erreur critique: la variable d'environnement GEMINI_API_KEY n'est pas définie."
     )
+    # Abort import if the API key is missing.  This prevents the FastAPI app
+    # from starting in a misconfigured state.
     raise SystemExit(
         "GEMINI_API_KEY non définie. Veuillez définir cette variable d'environnement et redémarrer."
     )
 
-# Default Gemini model
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 # -----------------------------------------------------------------------------
 # File paths and defaults
+#
+# By default the module reads configuration from `sources.json` and persists
+# discovered URLs into `memory_db.json`.  These filenames can be overridden
+# via environment variables if necessary (e.g. for testing).
 SOURCES_FILE: str = os.getenv("SOURCES_FILE", "sources.json")
 MEMORY_FILE: str = os.getenv("MEMORY_FILE", "memory_db.json")
 
+# Default structure for an empty memory file.  Using a dict makes it trivial
+# to extend the schema later if needed.  In addition to the list of seen URLs,
+# we now store a mapping of URL -> detailed description and a list of reports.
 DEFAULT_MEMORY: Dict[str, Any] = {
-    "seen_urls": [],
-    "details": {},  # url -> {"title": str, "summary": str, "text": str}
-    "reports": [],
+    "seen_urls": [],       # List of all URLs that have been processed
+    "details": {},         # Mapping from URL to its detailed description
+    "reports": []          # History of generated reports with timestamps
 }
 
+
 # -----------------------------------------------------------------------------
-# Pydantic models
+# Pydantic model for the sources configuration
+#
+# This model enforces that `veille_par_sujet` and `veille_par_url` are lists of
+# strings.  If additional keys are present in the JSON, they will be ignored
+# unless explicitly defined here.
 class SourceConfig(BaseModel):
     veille_par_sujet: List[str] = []
     veille_par_url: List[str] = []
 
 
+# Request model for updating the sources configuration.  Clients can either
+# specify a complete replacement via the `replace` field or indicate lists of
+# subjects/URLs to add or remove.  At least one of the fields must be
+# provided.
 class UpdateSourcesRequest(BaseModel):
     add_subjects: Optional[List[str]] = None
     add_urls: Optional[List[str]] = None
@@ -75,11 +94,21 @@ class UpdateSourcesRequest(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# Memory helpers
+# Memory management helpers
+#
 def safe_load_memory(path: str = MEMORY_FILE) -> Dict[str, Any]:
-    """
-    Charge le contenu du fichier mémoire en toute sécurité. Si le fichier est
-    inexistant ou mal formé, retourne une mémoire vierge.
+    """Load the persisted memory from disk.
+
+    If the file is missing, empty, corrupt, or does not match the expected
+    schema, a fresh copy of ``DEFAULT_MEMORY`` is returned and a log message
+    is emitted.  The returned value always contains the keys ``seen_urls``,
+    ``details``, and ``reports``.
+
+    Args:
+        path: The path to the memory JSON file.
+    Returns:
+        A dictionary with keys ``seen_urls`` (list of str), ``details`` (dict
+        mapping str to str), and ``reports`` (list of dicts).
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -89,36 +118,53 @@ def safe_load_memory(path: str = MEMORY_FILE) -> Dict[str, Any]:
                 f"Format de fichier mémoire invalide pour '{path}'. Réinitialisation de la mémoire."
             )
             return DEFAULT_MEMORY.copy()
+        # Assemble a full memory dict, filling in missing keys with defaults.
         memory: Dict[str, Any] = {
             "seen_urls": data.get("seen_urls", []),
             "details": data.get("details", {}),
             "reports": data.get("reports", []),
         }
-        # Validate types
+        # Validate types: seen_urls must be list, details must be dict, reports must be list
         if not isinstance(memory["seen_urls"], list):
-            logger.warning(f"'seen_urls' n'est pas une liste. Reset.")
+            logger.warning(
+                f"Le champ 'seen_urls' dans '{path}' n'est pas une liste. Réinitialisation de la mémoire."
+            )
             return DEFAULT_MEMORY.copy()
         if not isinstance(memory["details"], dict):
-            logger.warning(f"'details' n'est pas un objet. Reset.")
+            logger.warning(
+                f"Le champ 'details' dans '{path}' n'est pas un objet. Réinitialisation de la mémoire."
+            )
             return DEFAULT_MEMORY.copy()
         if not isinstance(memory["reports"], list):
-            logger.warning(f"'reports' n'est pas une liste. Reset.")
+            logger.warning(
+                f"Le champ 'reports' dans '{path}' n'est pas une liste. Réinitialisation de la mémoire."
+            )
             return DEFAULT_MEMORY.copy()
         return memory
     except FileNotFoundError:
-        logger.info(f"Fichier mémoire '{path}' non trouvé. Initialisation.")
+        logger.info(f"Fichier mémoire '{path}' non trouvé. Initialisation d'une nouvelle mémoire.")
         return DEFAULT_MEMORY.copy()
     except (json.JSONDecodeError, OSError) as e:
-        logger.error(f"Lecture mémoire '{path}' impossible: {e}. Reset.")
+        logger.error(f"Impossible de lire le fichier mémoire '{path}': {e}. Réinitialisation de la mémoire.")
         return DEFAULT_MEMORY.copy()
 
 
 def atomic_save_memory(memory: Dict[str, Any], path: str = MEMORY_FILE) -> None:
-    """
-    Enregistre la mémoire de manière atomique pour éviter la corruption de fichier.
+    """Atomically write the full memory structure to disk.
+
+    The data is first written to a temporary file within the same directory
+    before being moved into place.  This prevents partial writes from
+    corrupting the memory file.  The ``seen_urls`` list will be sorted to
+    ensure deterministic ordering.
+
+    Args:
+        memory: The memory dictionary to persist.  Must contain keys
+            ``seen_urls``, ``details``, and ``reports``.
+        path: The target memory file path.
     """
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
+    # Ensure 'seen_urls' is sorted for consistency.
     mem_copy = memory.copy()
     mem_copy["seen_urls"] = sorted(set(mem_copy.get("seen_urls", [])))
     fd, temp_path = tempfile.mkstemp(prefix=".memory_tmp_", dir=directory, text=True)
@@ -129,7 +175,7 @@ def atomic_save_memory(memory: Dict[str, Any], path: str = MEMORY_FILE) -> None:
             os.fsync(tmp_file.fileno())
         os.replace(temp_path, path)
         logger.info(
-            f"Sauvegarde mémoire OK. URLs: {len(mem_copy['seen_urls'])}."
+            f"Sauvegarde de la mémoire terminée. Nombre total d'URLs: {len(mem_copy['seen_urls'])}."
         )
     finally:
         try:
@@ -140,210 +186,124 @@ def atomic_save_memory(memory: Dict[str, Any], path: str = MEMORY_FILE) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Scraping helpers (NEW)
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; WatcherBot/1.0; +https://example.com/bot) "
-    "PythonRequests"
-)
-
-
-def _clean_text(text: str) -> str:
-    """
-    Normalise les espaces et supprime les lignes vides en excès.
-    """
-    text = re.sub(r"\r", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
-    return text.strip()
-
-
-def extract_main_text(html: str) -> Tuple[str, str]:
-    """
-    Extrait le titre et le texte principal d'un document HTML. Utilise BeautifulSoup
-    si disponible, sinon effectue un décapage basique des balises.
-    """
-    if not html:
-        return ("", "")
-    if BeautifulSoup is None:
-        # fallback: strip tags crudely
-        title_match = re.search(r"<title>(.*?)</title>", html, re.I | re.S)
-        title = title_match.group(1).strip() if title_match else ""
-        # remove tags
-        text = re.sub(r"<script.*?</script>", " ", html, flags=re.I | re.S)
-        text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
-        text = re.sub(r"<[^>]+>", " ", text)
-        return (title, _clean_text(text))
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # remove scripts/styles and common non-content containers
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    for sel in ["nav", "footer", "header", "form", "aside"]:
-        for t in soup.select(sel):
-            t.decompose()
-
-    title = ""
-    if soup.title and soup.title.string:
-        title = soup.title.string.strip()
-    else:
-        og = soup.find("meta", attrs={"property": "og:title"})
-        if og and og.get("content"):
-            title = og["content"].strip()
-
-    candidates = soup.select("article") or soup.select("main") or [soup.body or soup]
-    chunks: List[str] = []
-    for node in candidates:
-        text = node.get_text(separator="\n", strip=True)
-        if text:
-            chunks.append(text)
-    text = "\n\n".join(chunks) if chunks else soup.get_text(separator="\n", strip=True)
-    return (title, _clean_text(text))
-
-
-def fetch_url_text(url: str, timeout: int = 12) -> Tuple[str, str]:
-    """
-    Tente de récupérer le contenu HTML d'une URL et d'en extraire le titre et le
-    texte principal. En cas d'échec, retourne des chaînes vides.
-    """
-    if requests is None:
-        logger.warning("Le module 'requests' n'est pas installé. Impossible de scraper.")
-        return ("", "")
-    try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
-            timeout=timeout,
-        )
-        if resp.status_code >= 400:
-            logger.warning(f"Échec HTTP {resp.status_code} pour {url}")
-            return ("", "")
-        html = resp.text
-        return extract_main_text(html)
-    except Exception as e:
-        logger.warning(f"Erreur réseau pour {url}: {e}")
-        return ("", "")
-
-
-# -----------------------------------------------------------------------------
-# Gemini helpers
+# Gemini invocation helper
+#
 def call_gemini_with_retry(
-    prompt: Optional[str] = None,
-    *,
-    contents: Optional[List[Any]] = None,
+    prompt: str,
     max_retries: int = 3,
     initial_delay: int = 5,
-    model_name: str = DEFAULT_MODEL,
+    model_name: str = "gemini-2.5-flash"
 ) -> str:
+    """Call the Gemini API with retry logic and return the response text.
+
+    This helper abstracts away repeated attempts to contact the model.  It does
+    not raise on failure; instead, it logs errors and returns an empty string
+    after exhausting retries.
+
+    Args:
+        prompt: The textual prompt to send to the model.
+        max_retries: Maximum number of attempts before giving up.
+        initial_delay: Initial backoff delay (seconds) between retries.
+        model_name: Name of the Gemini model to use.
+    Returns:
+        The model's textual response, or an empty string if all attempts fail.
     """
-    Appelle le modèle Gemini avec gestion de la reconnexion. Accepte soit un
-    `prompt` (chaîne de caractères) soit `contents` (liste de messages structurés).
-    Retourne le texte de la réponse ou une chaîne vide en cas d'échec.
-    """
+
+    tools = [
+      {"url_context": {}},
+      {"google_search": {}}
+    ]
+
     model = genai.GenerativeModel(model_name=model_name)
     for attempt in range(max_retries):
         try:
-            if contents is not None:
-                # Lorsque 'contents' est fourni, passe-le explicitement en tant que
-                # paramètre nommé pour éviter les confusions avec 'prompt'.
-                response = model.generate_content(contents=contents)
-            elif prompt is not None:
-                response = model.generate_content(prompt)
-            else:
-                raise ValueError("Either `prompt` or `contents` must be provided.")
+            response = model.generate_content(
+                        contents="Give me three day events schedule based on YOUR_URL. Also let me know what needs to taken care of considering weather and commute.",
+                        generation_config=GenerationConfig(
+                            tools=tools,
+                        )
+                    )
 
-            # extraction standardisée du texte de la réponse
-            if getattr(response, "text", None):
+            # The API returns an object where `.text` holds the plain content.
+            # Fallback to candidate text if `.text` is missing.
+            if hasattr(response, "text") and response.text:
                 return response.text.strip()
+            # Some SDK versions nest the text inside `candidates[0]`.
             if getattr(response, "candidates", None):
-                cand = response.candidates[0]
-                text = getattr(cand, "text", "") or getattr(cand, "content", "")
+                candidate = response.candidates[0]
+                text = getattr(candidate, "text", "") or getattr(candidate, "content", "")
                 if text:
                     return str(text).strip()
-            logger.warning(f"Réponse vide de Gemini (tentative {attempt+1}/{max_retries})")
+            logger.warning(
+                f"Réponse vide de Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt: {prompt}"
+            )
         except Exception as e:
-            logger.error(f"Erreur Gemini (tentative {attempt+1}/{max_retries}): {e}")
+            logger.error(
+                f"Erreur lors de l'appel à Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt '{prompt}': {e}"
+            )
+        # If there are remaining attempts, sleep before the next try.
         if attempt < max_retries - 1:
             sleep_time = initial_delay * (2 ** attempt)
             logger.info(f"Nouvelle tentative dans {sleep_time} secondes...")
             time.sleep(sleep_time)
+    logger.error(
+        f"Toutes les tentatives ont échoué pour le prompt '{prompt}'. Retour d'une chaîne vide."
+    )
     return ""
 
 
-def summarize_with_url_context(url: str, scraped_text: str) -> str:
-    """
-    Tente d'analyser et de résumer le contenu d'une URL. Si l'utilisation du
-    contexte URL n'est pas disponible, s'appuie sur le texte scrappé. Cette
-    fonction n'utilise pas de 'url' part direct, car le SDK ne reconnaît pas un
-    dictionnaire avec la clé 'url' seule【649065952783530†L207-L260】. À la place,
-    on fournit l'URL comme simple texte dans le prompt. En cas d'échec ou si
-    aucun texte n'est disponible, retourne un message par défaut.
-    """
-    # 1) Prompt pour demander un résumé en mentionnant l'URL. On évite d'utiliser
-    # un 'url' part non pris en charge par le SDK.
-    url_prompt = (
-        "Analyse et résume précisément en français le contenu de cette URL. "
-        "Mets en avant les mises à jour, nouvelles informations et points clés. "
-        "Structure la réponse avec des puces claires et un court paragraphe de synthèse à la fin."
-    )
-
-    # On construit un prompt textuel qui inclut explicitement l'URL. Le modèle
-    # pourra utiliser ses connaissances ou échouer silencieusement si la
-    # récupération n'est pas possible.
-    try:
-        combined_prompt = f"{url_prompt}\n\nURL: {url}"
-        text = call_gemini_with_retry(prompt=combined_prompt)
-        if text:
-            return text
-    except Exception as e:
-        logger.info(f"Contexte URL non disponible ou a échoué pour {url}: {e}")
-
-    # 2) Fallback: si nous disposons du texte scrappé, résume-le.
-    if scraped_text:
-        fallback_prompt = (
-            "Voici le contenu d'une page web. Résume-le en français, en listant d'abord les points clés, "
-            "puis une synthèse courte et actionnable.\n\n"
-            f"CONTENU:\n{scraped_text[:15000]}"
-        )
-        return call_gemini_with_retry(prompt=fallback_prompt) or "Aucune description disponible pour cette URL."
-    # 3) Dernier recours
-    return "Aucune description disponible pour cette URL."
-
 
 # -----------------------------------------------------------------------------
-# Veille logic
+# Veille logic executed in a background task
+#
 async def perform_watch_task() -> None:
+    """Execute the monitoring logic in the background.
+
+    This coroutine reads the source configuration, consults Gemini for new URLs
+    based on subjects, deduplicates results against the memory file, and then
+    persists any new discoveries.  Exceptions are caught and logged so that
+    background tasks never propagate errors to the ASGI layer.
+    """
     logger.info("Tâche de veille démarrée.")
     try:
+        # Load and validate the sources configuration.
         with open(SOURCES_FILE, "r", encoding="utf-8") as f:
             config_data = json.load(f)
         config = SourceConfig(**config_data)
     except FileNotFoundError:
-        logger.error(f"Fichier de configuration '{SOURCES_FILE}' introuvable. Veille annulée.")
+        logger.error(
+            f"Fichier de configuration '{SOURCES_FILE}' introuvable. Veille annulée."
+        )
         return
     except (json.JSONDecodeError, ValidationError) as e:
-        logger.error(f"Config '{SOURCES_FILE}' invalide: {e}. Veille annulée.")
+        logger.error(
+            f"Le fichier de configuration '{SOURCES_FILE}' est invalide: {e}. Veille annulée."
+        )
         return
 
     subjects_to_watch = config.veille_par_sujet
     urls_to_watch = config.veille_par_url
-
+    # Load the full memory structure.  This provides seen_urls, details and reports.
     memory = safe_load_memory()
     seen_urls_set: Set[str] = set(memory.get("seen_urls", []))
-    details: Dict[str, Any] = memory.get("details", {})
+    details: Dict[str, str] = memory.get("details", {})
     new_urls: Set[str] = set()
-    new_details: Dict[str, Any] = {}
+    new_details: Dict[str, str] = {}
 
-    # Step 1: Find URLs from subjects (Gemini)
+    # Step 1: Monitor by subjects.  For each subject, ask Gemini to suggest a
+    # handful of relevant URLs.  The prompt instructs the model to output only
+    # URLs separated by whitespace to simplify parsing.  A simple regex is
+    # employed to extract the links.
     for subject in subjects_to_watch:
         logger.info(f"Analyse du sujet: '{subject}'")
         prompt = (
-            f"Liste jusqu'à 5 URLs pertinentes (http/https) pour ce sujet: {subject}\n"
-            "Retourne uniquement les URLs séparées par des espaces ou sauts de ligne, sans texte additionnel."
+            f"Liste jusqu'à 5 URLs pertinentes qui traitent du sujet suivant: {subject}. "
+            "Retourne uniquement les URLs (commençant par http ou https) séparées par des espaces ou des sauts de ligne. "
+            "Ne fournis aucune explication ou autre texte."
         )
-        response_text = call_gemini_with_retry(prompt=prompt)
+        response_text = call_gemini_with_retry(prompt)
         if not response_text:
-            logger.info(f"Aucune réponse pour le sujet '{subject}'.")
+            logger.info(f"Aucune réponse obtenue pour le sujet '{subject}'.")
             continue
         urls = re.findall(r"https?://\S+", response_text)
         cleaned_urls = [u.rstrip('.,);') for u in urls]
@@ -351,54 +311,58 @@ async def perform_watch_task() -> None:
             if url in seen_urls_set or url in new_urls:
                 continue
             new_urls.add(url)
-            logger.info(f"Nouvelle URL détectée pour '{subject}': {url}")
+            logger.info(f"Nouvelle URL détectée pour le sujet '{subject}': {url}")
 
-    # Step 2: Add explicit URLs from config
+    # Step 2: Monitor by explicit URLs.  Any URL not already in memory is
+    # considered new.
     for url in urls_to_watch:
         if url in seen_urls_set or url in new_urls:
             logger.info(f"URL déjà connue, ignorée: '{url}'")
             continue
         new_urls.add(url)
-        logger.info(f"Nouvelle URL depuis la configuration: '{url}'")
+        logger.info(f"Nouvelle URL ajoutée depuis la configuration: '{url}'")
 
-    # Step 3: For each newly discovered URL: SCRAPE + SUMMARIZE
+    # Step 3: For each newly discovered URL, generate a detailed description.
     for url in new_urls:
-        title, text = fetch_url_text(url)
-        summary = summarize_with_url_context(url, text)
+        # Build a prompt asking the model to describe the content of the URL.
+        description_prompt = (
+            f"Rédige un résumé détaillé et précis en français du contenu trouvé sur cette page : {url}. "
+            "Mets l'accent sur les mises à jour, les nouvelles ou les détails importants que cette page apporte. "
+            "Si tu ne peux pas accéder directement à la page, base-toi sur tes connaissances générales pour deviner la nature du contenu."
+        )
+        description = call_gemini_with_retry(description_prompt)
+        if not description:
+            description = "Aucune description disponible pour cette URL."
+        new_details[url] = description
+        logger.info(f"Description générée pour '{url}'.")
 
-        new_details[url] = {
-            "title": title or "",
-            "summary": summary or "",
-            "text": text or "",
-        }
-        logger.info(f"Résumé généré pour '{url}' (title='{title or 'N/A'}').")
-
-    # Step 4: Build a synthetic report of all new items
+    # Step 4: Generate a synthetic report summarising all new details.
     report_text = ""
     if new_details:
-        lines = []
-        for url, info in new_details.items():
-            t = info.get("title") or ""
-            s = info.get("summary") or ""
-            lines.append(f"- {t or 'Sans titre'}\n{url}\n{s}\n")
+        # Compose a prompt summarising the new details.
+        summary_lines = [f"{url}: {desc}" for url, desc in new_details.items()]
         report_prompt = (
-            "Rédige un rapport synthétique (en français) sur les nouveautés suivantes. "
-            "Pour chaque URL, liste 3-6 points clés, puis termine par une synthèse globale et 3 recommandations actionnables.\n\n"
-            + "\n".join(lines)
+            "Rédige un rapport synthétique en français qui résume les nouvelles informations suivantes en mettant en avant les éléments clés et leur pertinence :\n"
+            + "\n".join(summary_lines)
         )
-        report = call_gemini_with_retry(prompt=report_prompt)
-        report_text = report or "\n".join(lines)
+        report = call_gemini_with_retry(report_prompt)
+        if report:
+            report_text = report
+        else:
+            # Fallback to concatenating the descriptions if the model fails.
+            report_text = "\n".join(summary_lines)
 
-    # Step 5: Persist
+    # Step 5: Persist the updated memory if there are any new URLs or details.
     if new_urls:
+        # Update seen_urls, details, and reports in memory.
         memory_seen = set(memory.get("seen_urls", []))
         memory_seen.update(new_urls)
         memory["seen_urls"] = list(memory_seen)
-
+        # Merge existing details with new ones
         merged_details = memory.get("details", {})
         merged_details.update(new_details)
         memory["details"] = merged_details
-
+        # Append report entry if we generated a report
         if report_text:
             import datetime
             report_entry = {
@@ -409,33 +373,49 @@ async def perform_watch_task() -> None:
             reports_list = memory.get("reports", [])
             reports_list.append(report_entry)
             memory["reports"] = reports_list
-
+        # Save memory to disk
         atomic_save_memory(memory)
     else:
         logger.info("Aucune nouvelle URL à sauvegarder.")
+
     logger.info("Tâche de veille terminée.")
 
 
 # -----------------------------------------------------------------------------
-# FastAPI app
+# FastAPI application definition
+#
 app = FastAPI(
     title="Watcher API",
-    description="API de veille stratégique",
+    description=(
+        "Une API pour effectuer une veille stratégique sur des sujets et des URLs."
+    ),
 )
 
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows all origins
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
 )
 
 
 @app.post("/watch", summary="Déclenche la veille en tâche de fond")
 async def trigger_watch_endpoint(background_tasks: BackgroundTasks) -> Dict[str, str]:
+    """Trigger the background monitoring task and return immediately.
+
+    This endpoint schedules the `perform_watch_task` coroutine to run in the
+    background and immediately returns a confirmation message.  If the
+    configuration file is missing or invalid, the error will be logged by the
+    task itself and not affect the response.
+    """
+    # Use FastAPI's BackgroundTasks to schedule the coroutine.  Starlette will
+    # handle invocation of async callables automatically, so we pass the
+    # coroutine function directly.  Any exceptions will be logged within
+    # `perform_watch_task` and will not affect the request lifecycle.
     background_tasks.add_task(perform_watch_task)
-    logger.info("Requête de veille reçue. Tâche programmée en arrière-plan.")
+    logger.info("Requête de veille reçue. La tâche a été programmée en arrière-plan.")
     return {
         "message": "La veille a été lancée en arrière-plan. Consultez les logs pour les détails."
     }
@@ -443,20 +423,35 @@ async def trigger_watch_endpoint(background_tasks: BackgroundTasks) -> Dict[str,
 
 @app.get("/memory", summary="Affiche la mémoire complète")
 async def get_memory_content() -> Dict[str, Any]:
-    return safe_load_memory()
+    """Return the full memory structure.
+
+    This includes the list of seen URLs, the stored descriptions for each URL
+    and the history of generated reports.
+    """
+    memory = safe_load_memory()
+    return memory
 
 
 @app.get("/", summary="Endpoint de santé")
 async def root() -> Dict[str, str]:
+    """Simple health‑check endpoint."""
     return {"status": "ok", "message": "Watcher API is operational."}
 
 
-# Sources management
+# -----------------------------------------------------------------------------
+# Sources management endpoints
+#
 @app.get("/sources", summary="Lire la configuration des sources")
 async def read_sources() -> Dict[str, Any]:
+    """Return the current sources configuration.
+
+    Reads the contents of the sources file and returns it.  If the file is
+    missing or corrupt, an HTTP error is raised.
+    """
     try:
         with open(SOURCES_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+        # Validate using SourceConfig to ensure correct structure
         config = SourceConfig(**data)
         return config.dict()
     except FileNotFoundError:
@@ -467,6 +462,13 @@ async def read_sources() -> Dict[str, Any]:
 
 @app.post("/sources", summary="Modifier la configuration des sources")
 async def update_sources(update: UpdateSourcesRequest) -> Dict[str, Any]:
+    """Update the sources configuration.
+
+    Clients can specify lists of subjects and/or URLs to add or remove, or
+    provide a complete replacement configuration via the `replace` field.
+    Unknown keys in the payload will be ignored.
+    """
+    # Load existing configuration or initialize a fresh one if the file is missing.
     try:
         if os.path.exists(SOURCES_FILE):
             with open(SOURCES_FILE, "r", encoding="utf-8") as f:
@@ -477,26 +479,33 @@ async def update_sources(update: UpdateSourcesRequest) -> Dict[str, Any]:
     except (json.JSONDecodeError, ValidationError) as e:
         raise HTTPException(status_code=500, detail=f"Le fichier '{SOURCES_FILE}' est invalide: {e}")
 
+    # If replace is provided, overwrite entirely with the new configuration.
     if update.replace is not None:
         new_config = update.replace
     else:
+        # Start from the current config and apply additions/removals.
         new_config = SourceConfig(
             veille_par_sujet=list(current_config.veille_par_sujet),
             veille_par_url=list(current_config.veille_par_url),
         )
+        # Add new subjects
         if update.add_subjects:
             for subj in update.add_subjects:
                 if subj not in new_config.veille_par_sujet:
                     new_config.veille_par_sujet.append(subj)
+        # Add new URLs
         if update.add_urls:
             for url in update.add_urls:
                 if url not in new_config.veille_par_url:
                     new_config.veille_par_url.append(url)
+        # Remove subjects
         if update.remove_subjects:
             new_config.veille_par_sujet = [s for s in new_config.veille_par_sujet if s not in update.remove_subjects]
+        # Remove URLs
         if update.remove_urls:
             new_config.veille_par_url = [u for u in new_config.veille_par_url if u not in update.remove_urls]
 
+    # Persist the updated configuration
     try:
         with open(SOURCES_FILE, "w", encoding="utf-8") as f:
             json.dump(new_config.dict(), f, ensure_ascii=False, indent=2)
@@ -505,14 +514,21 @@ async def update_sources(update: UpdateSourcesRequest) -> Dict[str, Any]:
     return new_config.dict()
 
 
-# Details & reports
+# -----------------------------------------------------------------------------
+# Details and reports endpoints
+#
 @app.get("/details", summary="Consulter les descriptions enregistrées")
-async def get_details() -> Dict[str, Any]:
+async def get_details() -> Dict[str, str]:
+    """Return the mapping of URLs to their detailed descriptions."""
     memory = safe_load_memory()
     return memory.get("details", {})
 
 
 @app.get("/reports", summary="Consulter l'historique des rapports générés")
 async def get_reports() -> List[Dict[str, Any]]:
+    """Return the list of generated reports."""
     memory = safe_load_memory()
     return memory.get("reports", [])
+
+
+
