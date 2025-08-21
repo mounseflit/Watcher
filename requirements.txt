@@ -1,6 +1,9 @@
-fastapi
-google-generativeai
-pydantic
-uvicorn
 python-dotenv
 bs4
+fastapi
+uvicorn
+pydantic
+requests
+beautifulsoup4
+google-generativeai
+python-multipart
